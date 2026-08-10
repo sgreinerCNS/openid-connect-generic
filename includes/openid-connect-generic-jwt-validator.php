@@ -267,12 +267,62 @@ class OpenID_Connect_Generic_JWT_Validator {
 	}
 
 	/**
-	 * Enrich JWKS with algorithm from JWT header if missing.
+	 * Determine the signature algorithms a JWK may be used with.
 	 *
-	 * Some identity providers (like Microsoft Entra ID) return JWKs without
-	 * the "alg" parameter. This method adds the algorithm from the JWT header
-	 * to each key that's missing it, ensuring compatibility with the Firebase
-	 * JWT library which requires "alg" to be present.
+	 * Derived from the key material itself, never from the token, so that a
+	 * key can only ever be used with an algorithm it is actually meant for.
+	 * The first entry is the default for that key type.
+	 *
+	 * @param array $key A single JWK.
+	 *
+	 * @return array<string> The permitted algorithms, empty when the key type is unknown.
+	 */
+	private function get_permitted_algs_for_key( $key ) {
+		if ( empty( $key['kty'] ) ) {
+			return array();
+		}
+
+		switch ( $key['kty'] ) {
+			case 'RSA':
+				/*
+				 * RSASSA-PSS (PS256 and friends) is deliberately absent: the
+				 * JWT library does not implement it, so nominating it would
+				 * only trade one error for another.
+				 */
+				return array( 'RS256', 'RS384', 'RS512' );
+
+			case 'EC':
+				$curve = isset( $key['crv'] ) ? $key['crv'] : '';
+
+				switch ( $curve ) {
+					case 'P-256':
+						return array( 'ES256' );
+					case 'P-384':
+						return array( 'ES384' );
+					case 'P-521':
+						return array( 'ES512' );
+				}
+
+				return array();
+
+			default:
+				/*
+				 * Notably this excludes "oct" (symmetric) keys. Assigning an
+				 * algorithm to one would allow a token to be verified with a
+				 * shared secret where an asymmetric signature is expected.
+				 */
+				return array();
+		}
+	}
+
+	/**
+	 * Enrich JWKS with an algorithm for keys that do not declare one.
+	 *
+	 * Some identity providers (like Microsoft Entra ID) return JWKs without the
+	 * "alg" parameter, which the Firebase JWT library requires. The algorithm
+	 * is chosen from the set that the key type permits. The value from the JWT
+	 * header is only honoured when it is within that set, so a token can never
+	 * nominate an algorithm that does not match the key it is verified against.
 	 *
 	 * @param array  $jwks      The JWKS array with keys.
 	 * @param string $id_token  The JWT ID token.
@@ -280,22 +330,32 @@ class OpenID_Connect_Generic_JWT_Validator {
 	 * @return array The enriched JWKS array.
 	 */
 	private function enrich_jwks_with_alg( $jwks, $id_token ) {
-		// Extract algorithm from JWT header.
-		$jwt_alg = $this->get_jwt_header_alg( $id_token );
+		// The requested algorithm is untrusted input and only used as a hint.
+		$requested_alg = $this->get_jwt_header_alg( $id_token );
 
-		// If we couldn't extract the algorithm, default to RS256 (most common for OIDC).
-		if ( empty( $jwt_alg ) ) {
-			$jwt_alg = 'RS256';
+		if ( ! isset( $jwks['keys'] ) || ! is_array( $jwks['keys'] ) ) {
+			return $jwks;
 		}
 
-		// Add algorithm to keys that are missing it.
-		if ( isset( $jwks['keys'] ) && is_array( $jwks['keys'] ) ) {
-			foreach ( $jwks['keys'] as &$key ) {
-				if ( ! isset( $key['alg'] ) ) {
-					$key['alg'] = $jwt_alg;
-				}
+		foreach ( $jwks['keys'] as &$key ) {
+			if ( ! is_array( $key ) || isset( $key['alg'] ) ) {
+				continue;
 			}
+
+			$permitted_algs = $this->get_permitted_algs_for_key( $key );
+
+			if ( empty( $permitted_algs ) ) {
+				// Leave the key as it is and let the JWT library reject it.
+				continue;
+			}
+
+			$key['alg'] = ( ! empty( $requested_alg ) && in_array( $requested_alg, $permitted_algs, true ) )
+				? $requested_alg
+				: $permitted_algs[0];
 		}
+
+		// Break the reference left behind by the loop.
+		unset( $key );
 
 		return $jwks;
 	}
