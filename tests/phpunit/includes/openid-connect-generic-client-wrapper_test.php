@@ -585,4 +585,57 @@ class OpenID_Connect_Generic_Client_Wrapper_Test extends WP_UnitTestCase {
 		$this->assertEquals( 'refreshed@example.com', $stored_user_claim['email'], 'Refreshed user claim should be stored with user_option' );
 	}
 
+	/**
+	 * Test the end session host is added to the allowed redirect hosts.
+	 *
+	 * @group ClientWrapperTests
+	 */
+	public function test_update_allowed_redirect_hosts_adds_the_end_session_host() {
+
+		$client_wrapper = $this->create_client_wrapper( 'https://idp.example.com/logout' );
+
+		$allowed = $client_wrapper->update_allowed_redirect_hosts( array( 'example.com' ) );
+
+		$this->assertEquals( array( 'example.com', 'idp.example.com' ), $allowed );
+
+	}
+
+	/**
+	 * Test an unusable end session endpoint leaves the allowed hosts alone.
+	 *
+	 * Returning anything other than an array here breaks wp_validate_redirect()
+	 * for the whole site.
+	 *
+	 * @group ClientWrapperTests
+	 */
+	public function test_update_allowed_redirect_hosts_keeps_list_for_unusable_endpoint() {
+
+		$client_wrapper = $this->create_client_wrapper( 'not-a-url' );
+
+		$allowed = $client_wrapper->update_allowed_redirect_hosts( array( 'example.com' ) );
+
+		$this->assertEquals( array( 'example.com' ), $allowed );
+
+	}
+
+	/**
+	 * Helper to create a client wrapper with a specific end session endpoint.
+	 *
+	 * @param string $endpoint_end_session The IDP logout endpoint URL.
+	 *
+	 * @return OpenID_Connect_Generic_Client_Wrapper
+	 */
+	private function create_client_wrapper( $endpoint_end_session ) {
+
+		$settings = new OpenID_Connect_Generic_Option_Settings( array() );
+		$settings->endpoint_end_session = $endpoint_end_session;
+
+		return new OpenID_Connect_Generic_Client_Wrapper(
+			$this->createMock( OpenID_Connect_Generic_Client::class ),
+			$settings,
+			$this->createMock( OpenID_Connect_Generic_Option_Logger::class )
+		);
+
+	}
+
 }

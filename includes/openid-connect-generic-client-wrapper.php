@@ -36,6 +36,16 @@ class OpenID_Connect_Generic_Client_Wrapper {
 	const COOKIE_TOKEN_REFRESH_KEY = 'openid-connect-generic-refresh';
 
 	/**
+	 * The state binding cookie key.
+	 *
+	 * Holds an opaque random value that ties a generated state to the user
+	 * agent that requested it.
+	 *
+	 * @var string
+	 */
+	const COOKIE_STATE_BINDING_KEY = 'openid-connect-generic-state-binding';
+
+	/**
 	 * The client object instance.
 	 *
 	 * @var OpenID_Connect_Generic_Client
@@ -98,6 +108,13 @@ class OpenID_Connect_Generic_Client_Wrapper {
 
 		// Alter the requests according to settings.
 		add_filter( 'openid-connect-generic-alter-request', array( $client_wrapper, 'alter_request' ), 10, 2 );
+
+		/*
+		 * Make sure a state binding cookie exists before the login page starts
+		 * sending output, so that states generated for the login button can be
+		 * bound to the user agent.
+		 */
+		add_action( 'login_init', array( $client_wrapper, 'prime_state_binding_cookie' ) );
 
 		// Ensure tokens are refreshed before they expire.
 		if ( $settings->token_refresh_enable ) {
@@ -193,6 +210,76 @@ class OpenID_Connect_Generic_Client_Wrapper {
 	}
 
 	/**
+	 * Implements WordPress action login_init.
+	 *
+	 * Creates the state binding cookie while the response headers are still
+	 * open, so that the login button rendered later in the page can hand out a
+	 * bound state.
+	 *
+	 * @return void
+	 */
+	public function prime_state_binding_cookie() {
+		$this->get_state_binding( true );
+	}
+
+	/**
+	 * Get the state binding value of the current user agent.
+	 *
+	 * @param bool $create Whether a missing value should be created and sent as a cookie.
+	 *
+	 * @return string The binding value, or an empty string when none is available.
+	 */
+	private function get_state_binding( $create = false ) {
+		if ( ! empty( $_COOKIE[ self::COOKIE_STATE_BINDING_KEY ] ) ) {
+			$binding = sanitize_text_field( wp_unslash( $_COOKIE[ self::COOKIE_STATE_BINDING_KEY ] ) );
+
+			if ( preg_match( '/^[a-f0-9]{32}$/', $binding ) ) {
+				return $binding;
+			}
+		}
+
+		/*
+		 * The cookie can only be sent while the headers are still open. When
+		 * they are not, the flow continues without a binding rather than
+		 * breaking the login.
+		 */
+		if ( ! $create || headers_sent() ) {
+			return '';
+		}
+
+		$binding = bin2hex( random_bytes( 16 ) );
+
+		/*
+		 * The value identifies the user agent, not a single flow, so it is kept
+		 * for a while and reused. That keeps concurrent logins in several tabs
+		 * working, while the state itself stays single use.
+		 */
+		setcookie(
+			self::COOKIE_STATE_BINDING_KEY,
+			$binding,
+			array(
+				'expires'  => time() + HOUR_IN_SECONDS,
+				// Root path rather than COOKIEPATH: the authorization response is
+				// handled under wp-admin, which is not always below the home path.
+				// The value is an opaque marker that grants nothing on its own, so
+				// the wider scope costs nothing.
+				'path'     => '/',
+				'domain'   => defined( 'COOKIE_DOMAIN' ) && ! empty( COOKIE_DOMAIN ) ? COOKIE_DOMAIN : '',
+				'secure'   => is_ssl(),
+				'httponly' => true,
+				// Lax, not Strict: the authorization response arrives as a cross site
+				// top level redirect from the IDP and has to carry the cookie.
+				'samesite' => 'Lax',
+			)
+		);
+
+		// Make the new value available to the remainder of this request.
+		$_COOKIE[ self::COOKIE_STATE_BINDING_KEY ] = $binding;
+
+		return $binding;
+	}
+
+	/**
 	 * Create a single use authentication url
 	 *
 	 * @param array<string> $atts An optional array of override/feature attributes.
@@ -229,16 +316,34 @@ class OpenID_Connect_Generic_Client_Wrapper {
 			$url_format .= '&acr_values=%7$s';
 		}
 
+		$state = $this->client->new_state( $atts['redirect_to'], $this->get_state_binding( true ) );
+
 		$url = sprintf(
 			$url_format,
 			$atts['endpoint_login'],
 			$separator,
 			rawurlencode( $atts['scope'] ),
 			rawurlencode( $atts['client_id'] ),
-			$this->client->new_state( $atts['redirect_to'] ),
+			$state,
 			rawurlencode( $atts['redirect_uri'] ),
 			rawurlencode( $atts['acr_values'] )
 		);
+
+		// Bind the ID token that comes back to this request. OIDC Core section 3.1.2.1.
+		$nonce = $this->client->get_state_nonce();
+		if ( ! empty( $nonce ) ) {
+			$url .= '&nonce=' . rawurlencode( $nonce );
+		}
+
+		/*
+		 * Bind the authorization code to this client. Unknown request
+		 * parameters are ignored by the authorization server, so this stays
+		 * compatible with IDPs that do not implement PKCE. RFC 7636 section 4.3.
+		 */
+		$code_challenge = $this->client->get_state_code_challenge();
+		if ( ! empty( $code_challenge ) ) {
+			$url .= '&code_challenge=' . rawurlencode( $code_challenge ) . '&code_challenge_method=S256';
+		}
 
 		$url = apply_filters( 'openid-connect-generic-auth-url', $url );
 		$url = esc_url_raw( $url );
@@ -349,12 +454,14 @@ class OpenID_Connect_Generic_Client_Wrapper {
 	 *
 	 * @param array<string> $allowed The allowed redirect host names.
 	 *
-	 * @return array<string>|bool
+	 * @return array<string>
 	 */
 	public function update_allowed_redirect_hosts( $allowed ) {
 		$host = parse_url( $this->settings->endpoint_end_session, PHP_URL_HOST );
 		if ( ! $host ) {
-			return false;
+			// Leave the list untouched. Replacing it would break every other
+			// redirect validation on the site.
+			return $allowed;
 		}
 
 		$allowed[] = $host;
@@ -449,7 +556,7 @@ class OpenID_Connect_Generic_Client_Wrapper {
 		$client = $this->client;
 
 		// Start the authentication flow.
-		$authentication_request = $client->validate_authentication_request( $_GET );
+		$authentication_request = $client->validate_authentication_request( $_GET, $this->get_state_binding() );
 
 		if ( is_wp_error( $authentication_request ) ) {
 			// Check if this is a retryable IDP error (e.g. Safari ITP causing
@@ -533,8 +640,18 @@ class OpenID_Connect_Generic_Client_Wrapper {
 			$this->error_redirect( $id_token_claim );
 		}
 
+		/**
+		 * Filters the nonce the ID token is required to contain.
+		 *
+		 * Returning an empty value skips the check, for use with IDPs that do
+		 * not return the nonce of the authentication request.
+		 *
+		 * @param string $nonce The nonce stored with the state of this flow.
+		 */
+		$expected_nonce = apply_filters( 'openid-connect-generic-expected-nonce', $client->get_state_nonce() );
+
 		// Validate our id_token has required values.
-		$valid = $client->validate_id_token_claim( $id_token_claim );
+		$valid = $client->validate_id_token_claim( $id_token_claim, $expected_nonce );
 
 		if ( is_wp_error( $valid ) ) {
 			$this->error_redirect( $valid );
@@ -601,11 +718,15 @@ class OpenID_Connect_Generic_Client_Wrapper {
 
 		// Default redirect to the homepage.
 		$redirect_url = home_url();
-		// Redirect user according to redirect set in state.
-		$state_object = get_transient( 'openid-connect-generic-state--' . $state );
-		// Get the redirect URL stored with the corresponding authentication request state.
-		if ( ! empty( $state_object ) && ! empty( $state_object[ $state ] ) && ! empty( $state_object[ $state ]['redirect_to'] ) ) {
-			$redirect_url = $state_object[ $state ]['redirect_to'];
+
+		/*
+		 * Get the redirect URL stored with the corresponding authentication
+		 * request state. The state transient itself is already consumed at this
+		 * point, so the value is read from the validated state data.
+		 */
+		$state_redirect_to = $client->get_state_redirect_to();
+		if ( ! empty( $state_redirect_to ) ) {
+			$redirect_url = $state_redirect_to;
 		}
 
 		// Provide backwards compatibility for customization using the deprecated cookie method.

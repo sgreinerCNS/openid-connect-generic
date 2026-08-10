@@ -137,6 +137,26 @@ class OpenID_Connect_Generic_Client {
 	private $allow_internal_idp;
 
 	/**
+	 * Whether to protect the authorization code with PKCE.
+	 *
+	 * @see OpenID_Connect_Generic_Option_Settings::enable_pkce
+	 *
+	 * @var bool
+	 */
+	private $enable_pkce = true;
+
+	/**
+	 * The data stored alongside the state of the authentication flow that is
+	 * currently being processed.
+	 *
+	 * Populated by new_state() when a flow is started, and by check_state()
+	 * when an authorization response is validated.
+	 *
+	 * @var array<mixed>
+	 */
+	private $current_state = array();
+
+	/**
 	 * The logger object instance.
 	 *
 	 * @var OpenID_Connect_Generic_Option_Logger
@@ -160,8 +180,9 @@ class OpenID_Connect_Generic_Client {
 	 * @param int                                  $state_time_limit   @see OpenID_Connect_Generic_Option_Settings::state_time_limit for description.
 	 * @param bool                                 $allow_internal_idp @see OpenID_Connect_Generic_Option_Settings::allow_internal_idp for description.
 	 * @param OpenID_Connect_Generic_Option_Logger $logger             The plugin logging object instance.
+	 * @param bool                                 $enable_pkce        @see OpenID_Connect_Generic_Option_Settings::enable_pkce for description.
 	 */
-	public function __construct( $client_id, $client_secret, $scope, $endpoint_login, $endpoint_userinfo, $endpoint_token, $redirect_uri, $acr_values, $endpoint_jwks, $issuer, $jwks_cache_ttl, $state_time_limit, $allow_internal_idp, $logger ) {
+	public function __construct( $client_id, $client_secret, $scope, $endpoint_login, $endpoint_userinfo, $endpoint_token, $redirect_uri, $acr_values, $endpoint_jwks, $issuer, $jwks_cache_ttl, $state_time_limit, $allow_internal_idp, $logger, $enable_pkce = true ) {
 		$this->client_id = $client_id;
 		$this->client_secret = $client_secret;
 		$this->scope = $scope;
@@ -176,6 +197,7 @@ class OpenID_Connect_Generic_Client {
 		$this->state_time_limit = $state_time_limit;
 		$this->allow_internal_idp = $allow_internal_idp;
 		$this->logger = $logger;
+		$this->enable_pkce = boolval( $enable_pkce );
 	}
 
 	/**
@@ -237,11 +259,12 @@ class OpenID_Connect_Generic_Client {
 	/**
 	 * Validate the request for login authentication
 	 *
-	 * @param array<string> $request The authentication request results.
+	 * @param array<string> $request       The authentication request results.
+	 * @param string        $state_binding The user agent's state binding value, when available.
 	 *
 	 * @return array<string>|WP_Error
 	 */
-	public function validate_authentication_request( $request ) {
+	public function validate_authentication_request( $request, $state_binding = '' ) {
 		// Look for an existing error of some kind.
 		if ( isset( $request['error'] ) ) {
 			$error_code = sanitize_text_field( $request['error'] );
@@ -270,7 +293,7 @@ class OpenID_Connect_Generic_Client {
 			return new WP_Error( 'missing-state', __( 'Missing state.', 'daggerhart-openid-connect-generic' ), $request );
 		}
 
-		if ( ! $this->check_state( $request['state'] ) ) {
+		if ( ! $this->check_state( $request['state'], $state_binding ) ) {
 			return new WP_Error( 'invalid-state', __( 'Invalid state.', 'daggerhart-openid-connect-generic' ), $request );
 		}
 
@@ -319,6 +342,15 @@ class OpenID_Connect_Generic_Client {
 
 		if ( ! empty( $this->acr_values ) ) {
 			$request['body'] += array( 'acr_values' => $this->acr_values );
+		}
+
+		/*
+		 * Prove possession of the PKCE code verifier that was used to build the
+		 * code challenge of this flow. Only sent when the state that was just
+		 * validated actually carries a verifier. RFC 7636 section 4.5.
+		 */
+		if ( ! empty( $this->current_state['code_verifier'] ) ) {
+			$request['body']['code_verifier'] = $this->current_state['code_verifier'];
 		}
 
 		// Allow modifications to the request.
@@ -457,17 +489,41 @@ class OpenID_Connect_Generic_Client {
 	/**
 	 * Generate a new state, save it as a transient, and return the state hash.
 	 *
-	 * @param string $redirect_to The redirect URL to be used after IDP authentication.
+	 * @param string $redirect_to   The redirect URL to be used after IDP authentication.
+	 * @param string $state_binding A value known only to the user agent that starts
+	 *                              this flow. When provided, the authorization
+	 *                              response is only accepted from that same user
+	 *                              agent. An empty value leaves the state unbound.
 	 *
 	 * @return string
 	 */
-	public function new_state( $redirect_to ) {
+	public function new_state( $redirect_to, $state_binding = '' ) {
 		// New state with cryptographically secure random bytes.
 		$state = bin2hex( random_bytes( 16 ) );
+
+		$state_data = array(
+			'redirect_to' => $redirect_to,
+			// Binds the returned ID token to this request. OIDC Core section 3.1.2.1.
+			'nonce'       => bin2hex( random_bytes( 16 ) ),
+		);
+
+		/*
+		 * Bind the state to the user agent that starts the flow so that an
+		 * authorization response cannot be replayed into a different browser.
+		 * Only the hash is stored, so a read of the options table does not
+		 * disclose a usable binding value.
+		 */
+		if ( ! empty( $state_binding ) ) {
+			$state_data['binding'] = $this->hash_state_binding( $state_binding );
+		}
+
+		// Protect the authorization code against interception. RFC 7636.
+		if ( $this->enable_pkce ) {
+			$state_data['code_verifier'] = $this->new_code_verifier();
+		}
+
 		$state_value = array(
-			$state => array(
-				'redirect_to' => $redirect_to,
-			),
+			$state => $state_data,
 		);
 
 		// Allow storing more data with the state. Eg. to identify user relationships.
@@ -475,17 +531,25 @@ class OpenID_Connect_Generic_Client {
 
 		set_transient( 'openid-connect-generic-state--' . $state, $state_value, $this->state_time_limit );
 
+		$this->current_state = isset( $state_value[ $state ] ) && is_array( $state_value[ $state ] ) ? $state_value[ $state ] : $state_data;
+
 		return $state;
 	}
 
 	/**
-	 * Check the existence of a given state transient.
+	 * Check the existence of a given state transient, verify that it belongs to
+	 * the user agent completing the flow, and consume it.
 	 *
-	 * @param string $state The state hash to validate.
+	 * The state is single use. It is deleted as soon as it has been found, so
+	 * that an authorization response cannot be replayed while the state is
+	 * still within its time limit.
+	 *
+	 * @param string $state         The state hash to validate.
+	 * @param string $state_binding The user agent's state binding value, when available.
 	 *
 	 * @return bool
 	 */
-	public function check_state( $state ) {
+	public function check_state( $state, $state_binding = '' ) {
 
 		$state_found = true;
 
@@ -500,7 +564,98 @@ class OpenID_Connect_Generic_Client {
 			do_action( 'openid-connect-generic-state-expired', $state );
 		}
 
-		return boolval( $valid );
+		if ( ! $valid ) {
+			return false;
+		}
+
+		// Consume the state before it is used for anything else.
+		delete_transient( 'openid-connect-generic-state--' . $state );
+
+		$state_data = ( is_array( $valid ) && isset( $valid[ $state ] ) && is_array( $valid[ $state ] ) ) ? $valid[ $state ] : array();
+
+		/*
+		 * A state that was issued with a binding is only valid for the user
+		 * agent it was issued to. States without a binding stay acceptable, as
+		 * the cookie cannot always be set when the authentication URL is built
+		 * (for example when the login button is rendered inside page content
+		 * that has already started sending output).
+		 */
+		if ( ! empty( $state_data['binding'] ) ) {
+			if ( empty( $state_binding ) || ! hash_equals( $state_data['binding'], $this->hash_state_binding( $state_binding ) ) ) {
+				do_action( 'openid-connect-generic-state-binding-mismatch', $state );
+				$this->logger->log(
+					'The authorization response was returned to a different browser than the one that started the login.',
+					'state-binding-mismatch'
+				);
+				return false;
+			}
+		}
+
+		$this->current_state = $state_data;
+
+		return true;
+	}
+
+	/**
+	 * Hash a state binding value for storage and comparison.
+	 *
+	 * @param string $state_binding The raw binding value from the user agent.
+	 *
+	 * @return string
+	 */
+	private function hash_state_binding( $state_binding ) {
+		return hash_hmac( 'sha256', $state_binding, wp_salt( 'nonce' ) );
+	}
+
+	/**
+	 * Generate a PKCE code verifier.
+	 *
+	 * @return string A 43 character base64url encoded string. RFC 7636 section 4.1.
+	 */
+	private function new_code_verifier() {
+		return rtrim( strtr( base64_encode( random_bytes( 32 ) ), '+/', '-_' ), '=' );
+	}
+
+	/**
+	 * Provide the PKCE code challenge for the current authentication flow.
+	 *
+	 * @return string The S256 code challenge, or an empty string when PKCE is
+	 *                not in use for this flow.
+	 */
+	public function get_state_code_challenge() {
+		if ( empty( $this->current_state['code_verifier'] ) ) {
+			return '';
+		}
+
+		// RFC 7636 section 4.2.
+		return rtrim( strtr( base64_encode( hash( 'sha256', $this->current_state['code_verifier'], true ) ), '+/', '-_' ), '=' );
+	}
+
+	/**
+	 * Provide the nonce of the current authentication flow.
+	 *
+	 * @return string
+	 */
+	public function get_state_nonce() {
+		return ! empty( $this->current_state['nonce'] ) ? strval( $this->current_state['nonce'] ) : '';
+	}
+
+	/**
+	 * Provide the redirect URL that was stored with the current state.
+	 *
+	 * @return string
+	 */
+	public function get_state_redirect_to() {
+		return ! empty( $this->current_state['redirect_to'] ) ? strval( $this->current_state['redirect_to'] ) : '';
+	}
+
+	/**
+	 * Provide all data stored with the current state.
+	 *
+	 * @return array<mixed>
+	 */
+	public function get_state_value() {
+		return $this->current_state;
 	}
 
 	/**
@@ -642,11 +797,15 @@ class OpenID_Connect_Generic_Client {
 	/**
 	 * Ensure the id_token_claim contains the required values.
 	 *
-	 * @param array $id_token_claim The ID token claim.
+	 * @param array       $id_token_claim The ID token claim.
+	 * @param string|null $expected_nonce The nonce that was sent with the authentication
+	 *                                    request. When empty, no nonce check is performed,
+	 *                                    which is the case for tokens obtained through a
+	 *                                    refresh instead of an authentication request.
 	 *
 	 * @return bool|WP_Error
 	 */
-	public function validate_id_token_claim( $id_token_claim ) {
+	public function validate_id_token_claim( $id_token_claim, $expected_nonce = null ) {
 		if ( ! is_array( $id_token_claim ) ) {
 			return new WP_Error( 'bad-id-token-claim', __( 'Bad ID token claim.', 'daggerhart-openid-connect-generic' ), $id_token_claim );
 		}
@@ -708,17 +867,41 @@ class OpenID_Connect_Generic_Client {
 				);
 				return new WP_Error(
 					'invalid-iss',
-					sprintf(
-						__( 'Token issuer does not match expected issuer.', 'daggerhart-openid-connect-generic' ),
-					),
+					__( 'Token issuer does not match expected issuer.', 'daggerhart-openid-connect-generic' ),
 					$id_token_claim
 				);
 			}
 		}
 
-		// Validate acr values when the option is set in the configuration.
-		if ( ! empty( $this->acr_values ) && isset( $id_token_claim['acr'] ) ) {
-			if ( $this->acr_values != $id_token_claim['acr'] ) {
+		/*
+		 * Verify the token was issued for the authentication request that this
+		 * flow started, and not replayed from another one.
+		 * OIDC Core section 3.1.3.7 item 11.
+		 */
+		if ( ! empty( $expected_nonce ) ) {
+			if ( ! isset( $id_token_claim['nonce'] ) ) {
+				return new WP_Error( 'missing-nonce', __( 'Token missing nonce claim.', 'daggerhart-openid-connect-generic' ), $id_token_claim );
+			}
+
+			if ( ! hash_equals( strval( $expected_nonce ), strval( $id_token_claim['nonce'] ) ) ) {
+				return new WP_Error( 'invalid-nonce', __( 'Token nonce does not match the authentication request.', 'daggerhart-openid-connect-generic' ), $id_token_claim );
+			}
+		}
+
+		/*
+		 * Validate acr values when the option is set in the configuration. A
+		 * missing claim is a failure: an IDP that does not confirm the
+		 * requested authentication context has not met the requirement.
+		 */
+		if ( ! empty( $this->acr_values ) ) {
+			if ( ! isset( $id_token_claim['acr'] ) ) {
+				return new WP_Error( 'missing-acr', __( 'Token missing acr claim.', 'daggerhart-openid-connect-generic' ), $id_token_claim );
+			}
+
+			// acr_values is a space separated list of accepted values. OIDC Core section 3.1.2.1.
+			$accepted_acr_values = preg_split( '/\s+/', trim( $this->acr_values ) );
+
+			if ( ! in_array( strval( $id_token_claim['acr'] ), $accepted_acr_values, true ) ) {
 				return new WP_Error( 'no-match-acr', __( 'No matching acr values.', 'daggerhart-openid-connect-generic' ), $id_token_claim );
 			}
 		}
