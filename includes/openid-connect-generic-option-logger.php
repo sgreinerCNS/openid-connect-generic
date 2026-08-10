@@ -55,6 +55,22 @@ class OpenID_Connect_Generic_Option_Logger {
 	private $logs;
 
 	/**
+	 * Data keys whose values must never be written to the log.
+	 *
+	 * @var array<string>
+	 */
+	private $sensitive_keys = array(
+		'access_token',
+		'authorization',
+		'client_secret',
+		'code',
+		'code_verifier',
+		'id_token',
+		'password',
+		'refresh_token',
+	);
+
+	/**
 	 * Setup the logger according to the needs of the instance.
 	 *
 	 * @param string|null    $default_message_type The log message type.
@@ -159,11 +175,91 @@ class OpenID_Connect_Generic_Option_Logger {
 			'time'            => ! empty( $time ) ? $time : time(),
 			'user_ID'         => ! is_null( $user_ID ) ? $user_ID : get_current_user_id(),
 			'uri'             => $request_uri,
-			'data'            => $data,
+			'data'            => $this->scrub_data( $data ),
 			'processing_time' => $processing_time,
 		);
 
 		return $message;
+	}
+
+	/**
+	 * Remove credentials and tokens from data before it is stored.
+	 *
+	 * Logged data regularly contains whole token responses and HTTP requests.
+	 * Those are written to an option and rendered on the settings page, so any
+	 * bearer token, refresh token or client secret in them would be readable
+	 * long after the request, including from database exports.
+	 *
+	 * @param mixed $data  The log message data.
+	 * @param int   $depth Current recursion depth.
+	 *
+	 * @return mixed The data with sensitive values replaced.
+	 */
+	private function scrub_data( $data, $depth = 0 ) {
+		// Guard against deeply nested or self referencing structures.
+		if ( $depth > 10 ) {
+			return '[truncated]';
+		}
+
+		if ( is_wp_error( $data ) ) {
+			$scrubbed = array();
+
+			foreach ( $data->get_error_codes() as $code ) {
+				$scrubbed[] = array(
+					'code'    => $code,
+					'message' => $this->scrub_string( $data->get_error_message( $code ) ),
+					'data'    => $this->scrub_data( $data->get_error_data( $code ), $depth + 1 ),
+				);
+			}
+
+			return $scrubbed;
+		}
+
+		if ( is_object( $data ) ) {
+			$data = get_object_vars( $data );
+		}
+
+		if ( is_array( $data ) ) {
+			$scrubbed = array();
+
+			foreach ( $data as $key => $value ) {
+				if ( is_string( $key ) && in_array( strtolower( $key ), $this->sensitive_keys, true ) ) {
+					$scrubbed[ $key ] = '[redacted]';
+					continue;
+				}
+
+				$scrubbed[ $key ] = $this->scrub_data( $value, $depth + 1 );
+			}
+
+			return $scrubbed;
+		}
+
+		if ( is_string( $data ) ) {
+			return $this->scrub_string( $data );
+		}
+
+		return $data;
+	}
+
+	/**
+	 * Mask serialized tokens found inside a string.
+	 *
+	 * @param string $value The string to scrub.
+	 *
+	 * @return string
+	 */
+	private function scrub_string( $value ) {
+		// A JWT: three base64url segments where the header decodes from JSON.
+		$value = preg_replace( '/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/', '[redacted-jwt]', $value );
+
+		// Tokens and secrets in a query string or serialized request body.
+		$value = preg_replace(
+			'/\b(access_token|refresh_token|id_token|client_secret|code|code_verifier)([=:]\s*"?)([^&"\s,}]+)/i',
+			'$1$2[redacted]',
+			$value
+		);
+
+		return $value;
 	}
 
 	/**

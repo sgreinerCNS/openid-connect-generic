@@ -141,4 +141,86 @@ class OpenID_Connect_Generic_Option_Logger_Test extends WP_UnitTestCase {
 
 	}
 
+	/**
+	 * Test credentials in logged arrays are replaced.
+	 *
+	 * @group LoggerTests
+	 * @group LogScrubbingTests
+	 */
+	public function test_plugin_logger_redacts_credentials_in_arrays() {
+
+		$this->logger->log(
+			array(
+				'body' => array(
+					'access_token'  => 'a-secret-access-token',
+					'refresh_token' => 'a-secret-refresh-token',
+					'client_secret' => 'a-secret-client-secret',
+					'token_type'    => 'Bearer',
+					'expires_in'    => 3600,
+				),
+			),
+			'token-response'
+		);
+
+		$logs = $this->logger->get_logs();
+		$data = $logs[0]['data'];
+
+		$this->assertEquals( '[redacted]', $data['body']['access_token'] );
+		$this->assertEquals( '[redacted]', $data['body']['refresh_token'] );
+		$this->assertEquals( '[redacted]', $data['body']['client_secret'] );
+		$this->assertEquals( 'Bearer', $data['body']['token_type'], 'Values that are not credentials stay readable for debugging.' );
+		$this->assertEquals( 3600, $data['body']['expires_in'] );
+
+	}
+
+	/**
+	 * Test tokens embedded in a logged string are replaced.
+	 *
+	 * @group LoggerTests
+	 * @group LogScrubbingTests
+	 */
+	public function test_plugin_logger_redacts_tokens_in_strings() {
+
+		$jwt = 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyMTIzIn0.c2lnbmF0dXJlLXZhbHVl';
+
+		$this->logger->log( 'Received id_token=' . $jwt . ' from the IDP', 'debug' );
+
+		$logs = $this->logger->get_logs();
+
+		$this->assertStringNotContainsString( $jwt, $logs[0]['data'] );
+
+	}
+
+	/**
+	 * Test the data attached to a logged WP_Error is scrubbed.
+	 *
+	 * WP_Error objects raised during the login flow routinely carry the whole
+	 * token response as their error data.
+	 *
+	 * @group LoggerTests
+	 * @group LogScrubbingTests
+	 */
+	public function test_plugin_logger_redacts_wp_error_data() {
+
+		$error = new WP_Error(
+			'invalid-token-response',
+			'Invalid token response',
+			array(
+				'id_token'     => 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl',
+				'access_token' => 'a-secret-access-token',
+				'token_type'   => 'Bearer',
+			)
+		);
+
+		$this->logger->log( $error, 'invalid-token-response' );
+
+		$logs = $this->logger->get_logs();
+		$dump = print_r( $logs[0]['data'], true );
+
+		$this->assertStringNotContainsString( 'a-secret-access-token', $dump );
+		$this->assertStringNotContainsString( 'eyJhbGciOiJSUzI1NiJ9', $dump );
+		$this->assertStringContainsString( 'Invalid token response', $dump, 'The error message itself stays available.' );
+
+	}
+
 }
