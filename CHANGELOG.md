@@ -1,5 +1,18 @@
 # OpenId Connect Generic Changelog
 
+**Unreleased**
+
+**SECURITY RELEASE**
+
+* Security: The state of an authentication request is now bound to the browser that started it, and is consumed on first use. Previously any generated state was accepted from any browser and stayed valid for its whole time limit, which allowed an authorization response to be replayed into another user's browser (login CSRF).
+* Security: Added PKCE (RFC 7636) to the authorization code flow. Can be turned off for identity providers that reject the `code_challenge` parameter.
+* Security: A `nonce` is now sent with every authentication request and validated in the ID token, per OIDC Core 3.1.3.7. Can be skipped through the new `openid-connect-generic-expected-nonce` filter.
+* Security: JWKS keys that omit `alg` are now completed from the key material instead of from the token header, so a token can no longer nominate the algorithm it is verified with.
+* Security: A configured ACR value is now required to be present in the ID token. Previously an IDP that omitted the `acr` claim silently skipped the check. `acr_values` is also treated as the space separated list the spec defines.
+* Security: Credentials and tokens are removed from log entries before they are written to the options table.
+* Security: Privacy enforcement now covers the REST API, which previously kept serving content and user data on a site configured as private.
+* Fix: `update_allowed_redirect_hosts()` no longer replaces the allowed hosts list with `false` when the end session endpoint has no parsable host, which broke redirect validation site wide.
+
 **3.11.3**
 
 * Feature/improvement: Added configurable issuer setting for JWT validation.

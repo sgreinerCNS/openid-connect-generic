@@ -84,6 +84,7 @@ On the settings page for this plugin (Dashboard > Settings > OpenID Connect Gene
 - End Session Endpoint URL: `OIDC_ENDPOINT_LOGOUT_URL`
 - OpenID scope: `OIDC_CLIENT_SCOPE` (space separated)
 - OpenID login type: `OIDC_LOGIN_TYPE` ('button' or 'auto')
+- Enable PKCE: `OIDC_ENABLE_PKCE` (boolean)
 - Enforce privacy: `OIDC_ENFORCE_PRIVACY` (boolean)
 - Create user if they do not exist: `OIDC_CREATE_IF_DOES_NOT_EXIST` (boolean)
 - Link existing user: `OIDC_LINK_EXISTING_USERS` (boolean)
@@ -155,6 +156,24 @@ add_filter('openid-connect-generic-auth-url', function( $url ) {
     $url.= '&my_custom_data=123abc';
     return $url;
 }); 
+```
+
+#### `openid-connect-generic-expected-nonce`
+
+Modify the nonce that the ID token is required to contain. The plugin sends a `nonce` with every authentication request
+and rejects an ID token that does not return it, as required by section 3.1.3.7 of the OpenID Connect Core
+specification.
+
+Provides 1 argument: the nonce stored with the state of the current login flow.
+
+Return an empty value to skip the check. This is only needed for identity providers that do not return the nonce of the
+authentication request.
+
+```
+add_filter('openid-connect-generic-expected-nonce', function( $nonce ) {
+    // Our IDP does not return the nonce, so do not require one.
+    return '';
+});
 ```
 
 #### `openid-connect-generic-user-login-test`

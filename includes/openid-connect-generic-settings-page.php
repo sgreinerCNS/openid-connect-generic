@@ -323,6 +323,13 @@ class OpenID_Connect_Generic_Settings_Page {
 				'type'        => 'number',
 				'section'     => 'client_settings',
 			),
+			'enable_pkce'   => array(
+				'title'       => __( 'Enable PKCE', 'daggerhart-openid-connect-generic' ),
+				'description' => __( 'Bind the authorization code to this site using PKCE (RFC 7636), so that a stolen code cannot be redeemed elsewhere. Recommended, and ignored by identity providers that do not support it. Only disable this if your identity provider rejects the code_challenge parameter.', 'daggerhart-openid-connect-generic' ),
+				'type'        => 'checkbox',
+				'disabled'    => defined( 'OIDC_ENABLE_PKCE' ),
+				'section'     => 'client_settings',
+			),
 			'acr_values'    => array(
 				'title'       => __( 'ACR values', 'daggerhart-openid-connect-generic' ),
 				'description' => __( 'Use a specific defined authentication contract from the IDP - optional.', 'daggerhart-openid-connect-generic' ),

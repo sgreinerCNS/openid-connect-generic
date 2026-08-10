@@ -38,6 +38,7 @@
  * @property string $issuer               The IDP issuer URL for JWT validation (optional - derived from endpoint_login if not set).
  * @property int    $jwks_cache_ttl       The JWKS cache TTL in seconds.
  * @property string $acr_values           The Authentication contract as defined on the IDP.
+ * @property bool   $enable_pkce          The flag to enable/disable PKCE for the authorization code flow.
  *
  * Non-standard Settings:
  *
@@ -108,6 +109,7 @@ class OpenID_Connect_Generic_Option_Settings {
 		'redirect_on_logout'        => 'OIDC_REDIRECT_ON_LOGOUT',
 		'redirect_user_back'        => 'OIDC_REDIRECT_USER_BACK',
 		'acr_values'                => 'OIDC_ACR_VALUES',
+		'enable_pkce'               => 'OIDC_ENABLE_PKCE',
 		'enable_logging'            => 'OIDC_ENABLE_LOGGING',
 		'log_limit'                 => 'OIDC_LOG_LIMIT',
 	);

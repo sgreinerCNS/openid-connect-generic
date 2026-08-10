@@ -46,6 +46,7 @@ Notes
   - openid-connect-modify-token-response-before-validation - modify the token response before validation
   - openid-connect-modify-id-token-claim-before-validation - modify the token claim before validation
   - openid-connect-generic-new-state-value     - modify the user's state value before it us saved.
+  - openid-connect-generic-expected-nonce      - the nonce the id_token must contain. Return an empty value to skip the check.
 
   Actions
   - openid-connect-generic-user-create                     - 2 args: fires when a new user is created by this plugin
@@ -56,6 +57,7 @@ Notes
   - openid-connect-generic-cron-daily                      - daily cron action
   - openid-connect-generic-state-not-found                 - the given state does not exist in the database, regardless of its expiration.
   - openid-connect-generic-state-expired                   - the given state exists, but expired before this login attempt.
+  - openid-connect-generic-state-binding-mismatch          - the given state was issued to a different user agent than the one completing the login.
 
   Callable actions
 
@@ -163,7 +165,8 @@ class OpenID_Connect_Generic {
 			$this->settings->jwks_cache_ttl,
 			$this->get_state_time_limit( $this->settings ),
 			$this->settings->allow_internal_idp,
-			$this->logger
+			$this->logger,
+			$this->settings->enable_pkce
 		);
 
 		$this->client_wrapper = OpenID_Connect_Generic_Client_Wrapper::register( $this->client, $this->settings, $this->logger );
@@ -238,6 +241,34 @@ class OpenID_Connect_Generic {
 				auth_redirect();
 			}
 		}
+	}
+
+	/**
+	 * Check if privacy enforcement is enabled, and deny REST API requests from
+	 * users that aren't logged in.
+	 *
+	 * Without this the REST API keeps serving content, users and other data of
+	 * a site that is meant to require a login.
+	 *
+	 * @param WP_Error|null|true $result The current authentication result.
+	 *
+	 * @return WP_Error|null|true
+	 */
+	public function enforce_privacy_rest( $result ) {
+		// Respect a result another authentication handler has already produced.
+		if ( ! empty( $result ) ) {
+			return $result;
+		}
+
+		if ( ! $this->settings->enforce_privacy || is_user_logged_in() ) {
+			return $result;
+		}
+
+		return new WP_Error(
+			'rest_not_logged_in',
+			__( 'Private site. You must be logged in to use the REST API.', 'daggerhart-openid-connect-generic' ),
+			array( 'status' => rest_authorization_required_code() )
+		);
 	}
 
 	/**
@@ -437,6 +468,7 @@ class OpenID_Connect_Generic {
 				'issuer'               => defined( 'OIDC_ISSUER' ) ? OIDC_ISSUER : '',
 				'jwks_cache_ttl'       => 3600,
 				'acr_values'           => defined( 'OIDC_ACR_VALUES' ) ? OIDC_ACR_VALUES : '',
+				'enable_pkce'          => defined( 'OIDC_ENABLE_PKCE' ) ? intval( OIDC_ENABLE_PKCE ) : 1,
 
 				// Non-standard settings.
 				'no_sslverify'           => 0,
@@ -470,6 +502,7 @@ class OpenID_Connect_Generic {
 
 		// Privacy hooks.
 		add_action( 'template_redirect', array( $plugin, 'enforce_privacy_redirect' ), 0 );
+		add_filter( 'rest_authentication_errors', array( $plugin, 'enforce_privacy_rest' ), 999 );
 		add_filter( 'the_content_feed', array( $plugin, 'enforce_privacy_feeds' ), 999 );
 		add_filter( 'the_excerpt_rss', array( $plugin, 'enforce_privacy_feeds' ), 999 );
 		add_filter( 'comment_text_rss', array( $plugin, 'enforce_privacy_feeds' ), 999 );
